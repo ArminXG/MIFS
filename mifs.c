@@ -293,25 +293,89 @@ static int check_and_do_access(char *path, char *dir, char *filename, int write)
 	return 0;
 }
 
-static void release_mifsfile(int i)
+static int do_release_mifsfile(int i)
 {
 	int fd;
 	int err;
+	int ret = 0;
 
 	/* called with filecache lock held */
-	if (filecache[i].write) {
-		fd = open(filecache[i].fullfilename, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-		err = errno;
-		log_msg("release_mifsfile: write-fd=%d : %s\n", fd, filecache[i].fullfilename);
+
+	fd = open(filecache[i].fullfilename, O_WRONLY | O_CREAT | O_DSYNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+	err = errno;
+	log_msg("release_mifsfile: write-fd=%d : %s\n", fd, filecache[i].fullfilename);
+	if (fd >= 0) {
+		if (write(fd, filecache[i].buf, mifs.filesize) != mifs.filesize) {
+			log_msg("release_mifsfile: error writing filenumber: %08llx\n", filecache[i].filenumber);
+			ret = 1;
+		}
+		close(fd);
+	} else {
+		log_msg("                  %s\n", strerror(err));
+		ret = 2;
+	}
+
+	return ret;
+}
+
+static int release_mifsfile(int i)
+{
+	int ret;
+	int fd;
+	int retry;
+	size_t pos, posa;
+	char *buf;
+
+	/* called with filecache lock held */
+
+	if (! (filecache[i].write)) {
+		return 0;
+	}
+
+	ret = do_release_mifsfile(i);
+
+	if (ret != 0) {
+		log_msg("    unlinking and re-trying\n");
+		unlink(filecache[i].fullfilename);
+		ret = do_release_mifsfile(i);
+	}
+	if (ret != 0) {
+		log_msg("    re-trying again\n");
+		ret = do_release_mifsfile(i);
+	}
+	if (ret != 0) {
+		log_msg("    giving up!\n");
+		return 1;
+	}
+
+	buf = malloc(mifs.filesize);
+
+	retry = 10;
+	while (retry > 0) {
+		retry--;
+		pos = 0;
+		fd = open(filecache[i].fullfilename, O_RDONLY);
 		if (fd >= 0) {
-			if (write(fd, filecache[i].buf, mifs.filesize) != mifs.filesize) {
-				log_msg("release_mifsfile: error writing filenumber: %08llx\n", filecache[i].filenumber);
+			while((posa = read(fd, buf + pos, mifs.filesize)) > 0) {
+					pos += posa;
+					if (pos >= mifs.filesize)
+						break;
 			}
 			close(fd);
-		} else {
-			log_msg("                  %s\n", strerror(err));
 		}
+		ret = memcmp(buf, filecache[i].buf, mifs.filesize);
+		if (ret == 0) {
+			retry = 0;
+			break;
+		}
+		log_msg("    written data not equal, writing again!\n");
+		do_release_mifsfile(i);
+		usleep((unsigned int)(500000 / retry));
 	}
+
+	free(buf);
+
+	return 0;
 }
 
 static void close_all_mifsfiles()
@@ -377,7 +441,7 @@ static int open_mifsfile(int write, struct mifs_file_s *fls)
 		log_msg("open_mifsfile: i=%d , fd=%d : %s : %s\n", i, fd, (fd < 0)?strerror(errno):"", filecache[i].fullfilename);
 		if (fd >= 0) {
 			while((posa = read(fd, filecache[i].buf + pos, mifs.filesize)) > 0) {
-				log_msg("open_mifsfile: initial read fd=%d , pos=%llu\n", fd, pos);
+				log_msg("open_mifsfile: initial read fd=%d , pos=%llu , read=%llu\n", fd, pos, posa);
 				pos += posa;
 				if (pos >= mifs.filesize)
 					break;
